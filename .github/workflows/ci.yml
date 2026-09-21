@@ -1,3 +1,4 @@
+---
 name: CI
 
 on:
@@ -5,87 +6,76 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  workflow_call:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
-  lock-check:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-
-      - name: Check uv lockfile
-        run: uv lock --check --no-config
-
   test:
+    name: test (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-
+        python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          version: "0.12.17"
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked --all-extras --no-config
+      - run: uv run --locked --no-config playwright install --with-deps chromium
+      - run: uv run --locked --no-config pytest tests/ -q
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: uv sync --locked --all-extras --no-config
-
-      - name: Run tests
-        run: uv run pytest tests/ -v --tb=short
-
-  type-check:
+  quality:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          version: "0.12.17"
+          python-version: "3.14"
+      - run: uv sync --locked --all-extras --no-config
+      - name: Check source and lockfile
+        run: |
+          uv lock --check --no-config
+          uv run --locked --no-config ruff check src/ tests/
+          uv run --locked --no-config ruff format --check src/ tests/
+          uv run --locked --no-config ty check src/forage/
+      - name: Audit workflows and release helper
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          uvx --no-config zizmor==1.30.1 --no-progress .github/workflows
+          shellcheck scripts/release.sh
+          shfmt -i 2 -d scripts/release.sh
+      - name: Build and install wheel
+        run: |
+          uv build --no-config
+          uv venv /tmp/forage-install-smoke
+          uv pip install --no-config --python /tmp/forage-install-smoke/bin/python dist/*.whl
+          /tmp/forage-install-smoke/bin/forage --version
+          /tmp/forage-install-smoke/bin/forage --help
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Install dependencies
-        run: uv sync --locked --all-extras --no-config
-
-      - name: Run type checker
-        run: uv run ty check src/forage/
-
-  lint:
+  check:
+    if: always()
+    needs: [test, quality]
     runs-on: ubuntu-latest
-
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Install ruff
-        run: uv tool install ruff
-
-      - name: Run ruff check
-        run: ruff check src/forage/ tests/
-
-      - name: Run ruff format check
-        run: ruff format --check src/forage/ tests/
+      - name: Require all checks
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: test "$TEST_RESULT" = success && test "$QUALITY_RESULT" = success

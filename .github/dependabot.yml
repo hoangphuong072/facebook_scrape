@@ -4,6 +4,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      dependencies:
+        patterns: ["*"]
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
@@ -12,6 +17,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      dependencies:
+        patterns: ["*"]
     open-pull-requests-limit: 5
     labels:
       - "dependencies"

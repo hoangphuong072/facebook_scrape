@@ -59,7 +59,7 @@ Random viewport sizes, `human_delay()` with variance, real Chromium browser, ses
 
 ### Test Structure
 
-Tests in `tests/` with HTML fixtures in `tests/fixtures/` (realistic Facebook HTML snippets). `conftest.py` provides `create_mock_element()` for creating mock Playwright `ElementHandle` objects from HTML strings.
+Tests in `tests/` with HTML fixtures in `tests/fixtures/` (realistic Facebook HTML snippets). `conftest.py` loads fixtures into real Playwright Chromium pages with network access blocked. Install Chromium before tests.
 
 ## Fragile Code — Check Here First When Things Break
 
@@ -101,7 +101,7 @@ Steps:
 3. Update `CHANGELOG.md` — add version section under `## [Unreleased]`, update comparison links at bottom
 4. Run `uv lock --check --no-config` and `uv run ruff format src/ tests/` — CI enforces formatting
 5. Commit: `git commit -m "chore: release vX.Y.Z"`
-6. Push: `git push origin master`
+6. Push a feature branch and open a PR. Merge only after all required checks pass. Never push directly to `master`.
 7. Tag: `git tag -a vX.Y.Z -m "Release vX.Y.Z"` then `git push origin vX.Y.Z`
 8. Create GitHub release: `gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."`
    — This triggers `.github/workflows/publish.yml` which publishes to PyPI via OIDC (no tokens)
