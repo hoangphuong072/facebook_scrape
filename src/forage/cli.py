@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import sys
+import json
+import os
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
 import click
+from pydantic import ValidationError
 from rich.console import Console
 
 from forage import __version__
 from forage.auth import (
     login as auth_login,
     session_exists,
+    get_session_path,
 )
+from forage.models import ScrapeResult
+from playwright.sync_api import sync_playwright
+
 from forage.scraper import (
     AuthenticationError,
     GroupNotFoundError,
@@ -21,6 +29,7 @@ from forage.scraper import (
     ScrapeOptions,
     scrape_group,
     search_marketplace,
+    calculate_date_range,
 )
 
 console = Console(stderr=True)
@@ -44,7 +53,7 @@ pass_context = click.make_pass_decorator(Context, ensure=True)
 @click.version_option(version=__version__)
 @pass_context
 def main(ctx: Context, verbose: bool, quiet: bool, no_color: bool):
-    """Scrape posts, comments, and reactions from private Facebook groups."""
+    """Scrape posts from Facebook groups and search Marketplace electronics."""
     ctx.verbose = verbose
     ctx.quiet = quiet
 
@@ -98,6 +107,13 @@ def login(ctx: Context, browser: str, session_dir: Optional[Path]):
     default=20,
     help="Maximum number of listings to fetch",
 )
+@click.option(
+    "--max-candidates",
+    type=click.IntRange(min=1),
+    default=200,
+    show_default=True,
+    help="Stop after this many candidates, including radius exclusions",
+)
 @click.option("-o", "--output", type=click.Path(path_type=Path), default=None)
 @click.option("--session-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--headless/--no-headless", default=True)
@@ -114,6 +130,7 @@ def marketplace(
     city: str,
     radius: str,
     limit: int,
+    max_candidates: int,
     output: Optional[Path],
     session_dir: Optional[Path],
     headless: bool,
@@ -128,6 +145,7 @@ def marketplace(
         city=city,
         radius=int(radius),
         limit=limit,
+        max_candidates=max_candidates,
         headless=headless,
         verbose=ctx.verbose,
         session_dir=session_dir,
@@ -315,6 +333,15 @@ def scrape(
         browser_type=browser,
     )
 
+    if output_format in {"sqlite", "csv"} and output is None:
+        raise click.UsageError(
+            f"{output_format.upper()} format requires --output file path"
+        )
+    try:
+        calculate_date_range(options)
+    except ValueError as error:
+        raise click.BadParameter(str(error), param_hint="--since/--until") from error
+
     if not session_exists(session_dir):
         if not ctx.quiet:
             console.print("[yellow]No saved session found.[/yellow]")
@@ -352,6 +379,29 @@ def scrape(
         console.print(f"[red]Error: {e}[/red]")
         raise SystemExit(1)
 
+    try:
+        _write_result(
+            result,
+            output_format,
+            output,
+            quiet=ctx.quiet,
+            top_comments=top_comments,
+            min_pain_score=min_pain_score,
+        )
+    except (OSError, sqlite3.Error) as error:
+        raise click.ClickException(str(error)) from error
+
+
+def _write_result(
+    result: ScrapeResult,
+    output_format: str,
+    output: Optional[Path],
+    *,
+    quiet: bool = False,
+    top_comments: int = 0,
+    min_pain_score: int = 0,
+) -> None:
+    """Use the same exporters for live and saved results."""
     if output_format == "sqlite":
         from forage.exporter import export_to_sqlite
 
@@ -359,7 +409,7 @@ def scrape(
             console.print("[red]SQLite format requires --output file path[/red]")
             raise SystemExit(2)
         export_to_sqlite(result, output)
-        if not ctx.quiet:
+        if not quiet:
             console.print(f"[green]Data exported to {output}[/green]")
     elif output_format == "csv":
         from forage.exporter import export_to_csv
@@ -368,7 +418,7 @@ def scrape(
             console.print("[red]CSV format requires --output file path[/red]")
             raise SystemExit(2)
         export_to_csv(result, output)
-        if not ctx.quiet:
+        if not quiet:
             comments_path = output.with_suffix(".comments.csv")
             console.print(f"[green]Posts exported to {output}[/green]")
             console.print(f"[green]Comments exported to {comments_path}[/green]")
@@ -385,7 +435,7 @@ def scrape(
                 top_comments=llm_top_comments,
                 min_pain_score=min_pain_score,
             )
-            if not ctx.quiet:
+            if not quiet:
                 console.print(
                     f"[green]LLM-optimized output written to {output}[/green]"
                 )
@@ -401,10 +451,89 @@ def scrape(
         json_output = result.model_dump_json(indent=2)
         if output:
             output.write_text(json_output, encoding="utf-8")
-            if not ctx.quiet:
+            if not quiet:
                 console.print(f"[green]Output written to {output}[/green]")
         else:
             click.echo(json_output)
+
+
+@main.command("export")
+@click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "llm", "csv", "sqlite"]),
+    default="json",
+)
+@click.option("-o", "--output", type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--top-comments", type=click.IntRange(min=0), default=0)
+@click.option("--min-pain-score", type=click.IntRange(min=0), default=0)
+@pass_context
+def export_saved(
+    ctx: Context,
+    source: Path,
+    output_format: str,
+    output: Optional[Path],
+    top_comments: int,
+    min_pain_score: int,
+) -> None:
+    """Convert a saved group JSON result without a Facebook session."""
+    if output_format in {"sqlite", "csv"} and output is None:
+        raise click.UsageError(
+            f"{output_format.upper()} format requires --output file path"
+        )
+    try:
+        result = ScrapeResult.model_validate_json(source.read_text(encoding="utf-8"))
+        _write_result(
+            result,
+            output_format,
+            output,
+            quiet=ctx.quiet,
+            top_comments=top_comments,
+            min_pain_score=min_pain_score,
+        )
+    except ValidationError as error:
+        raise click.ClickException("Input is not a group scrape JSON result") from error
+    except (OSError, sqlite3.Error) as error:
+        raise click.ClickException(str(error)) from error
+
+
+@main.command()
+@click.option("--session-dir", type=click.Path(path_type=Path))
+@click.option(
+    "--browser",
+    type=click.Choice(["chromium", "firefox", "webkit"]),
+    default="chromium",
+)
+def doctor(session_dir: Optional[Path], browser: str) -> None:
+    """Check local browser setup and session permissions without Facebook access."""
+    session_path = get_session_path(session_dir)
+    exists = session_path.is_file()
+    private = None
+    if exists and os.name == "posix":
+        private = not (
+            session_path.stat().st_mode & 0o077
+            or session_path.parent.stat().st_mode & 0o077
+        )
+    with sync_playwright() as playwright:
+        installed = Path(getattr(playwright, browser).executable_path).is_file()
+    click.echo(
+        json.dumps(
+            {
+                "version": __version__,
+                "browser": browser,
+                "browser_installed": installed,
+                "session_path": str(session_path),
+                "session_exists": exists,
+                "session_permissions_private": private,
+                "session_validity": "not_checked",
+            },
+            indent=2,
+        )
+    )
+    if not installed or not exists or private is False:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

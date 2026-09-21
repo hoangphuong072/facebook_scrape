@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from forage.models import Author, Comment
 from forage.scraper import (
     ScrapeOptions,
@@ -97,7 +99,7 @@ class TestCalculateDateRange:
 
         assert until.year == 2024
         assert until.month == 1
-        assert until.day == 15
+        assert until.day == 16
 
     def test_explicit_range(self) -> None:
         """Test explicit since and until dates."""
@@ -107,7 +109,7 @@ class TestCalculateDateRange:
         assert since.year == 2024
         assert since.month == 1
         assert since.day == 1
-        assert until.day == 15
+        assert until.day == 16
 
 
 class TestRandomDelay:
@@ -197,15 +199,14 @@ class TestCalculateDateRangeEdgeCases:
     def test_since_after_until(self) -> None:
         """Test when since is after until."""
         options = ScrapeOptions(since="2024-01-15", until="2024-01-01")
-        since, until = calculate_date_range(options)
-        # Should still return the dates as specified
-        assert since > until
+        with pytest.raises(ValueError, match="since"):
+            calculate_date_range(options)
 
     def test_same_day_range(self) -> None:
         """Test single day range."""
         options = ScrapeOptions(since="2024-01-15", until="2024-01-15")
         since, until = calculate_date_range(options)
-        assert since.date() == until.date()
+        assert until - since == timedelta(days=1)
 
     def test_very_large_days(self) -> None:
         """Test very large days value."""
@@ -373,7 +374,13 @@ class TestCommentDedupe:
             reply2: Comment(id="r2", author=Author(name="R2"), content="reply two"),
         }
 
-        def parse_comment(elem, *, skip_reactions: bool = False, verbose: bool = False):
+        def parse_comment(
+            elem,
+            *,
+            skip_reactions: bool = False,
+            verbose: bool = False,
+            post_id: str = "",
+        ):
             return comments_by_element[elem]
 
         def depth(elem, selector):
@@ -442,7 +449,13 @@ class TestCommentDedupe:
             reply_elem: Comment(id="r1", author=Author(name="B"), content="reply"),
         }
 
-        def parse_comment(elem, *, skip_reactions: bool = False, verbose: bool = False):
+        def parse_comment(
+            elem,
+            *,
+            skip_reactions: bool = False,
+            verbose: bool = False,
+            post_id: str = "",
+        ):
             return comments_by_element[elem]
 
         options = ScrapeOptions(delay=0)

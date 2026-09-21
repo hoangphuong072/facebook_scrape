@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +37,10 @@ def login(
     The user logs in manually, then presses Enter to save the session.
     """
     session_path = get_session_path(session_dir)
-    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if session_path.is_symlink() or session_path.parent.is_symlink():
+        raise ValueError("Session paths must not be symbolic links")
+    session_path.parent.chmod(0o700)
 
     console.print("[bold]Opening browser for Facebook login...[/bold]")
     console.print("Please log into Facebook in the browser window.")
@@ -53,7 +58,13 @@ def login(
         input()
 
         if is_logged_in_page(page):
-            context.storage_state(path=str(session_path))
+            # Open with private permissions before writing any authenticated state.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(session_path, flags, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
+                os.chmod(session_path, 0o600)
+                json.dump(context.storage_state(), state_file)
             console.print("[bold green]Session saved successfully![/bold green]")
         else:
             console.print("[bold red]Login not detected. Please try again.[/bold red]")

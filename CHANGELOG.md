@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve native comment IDs and scope fallback IDs to their post to prevent SQLite collisions.
+- Preserve full visible post text, expand supported “See more” controls, and exclude nested comments.
+- Parse compact comment counts and retain query-based post permalinks.
+- Include the full `--until` day, reject invalid date ranges before login, and preserve “Yesterday” clock times.
+- Report missing feeds and Marketplace authentication failures instead of misleading empty results or timeouts.
+- Bind Marketplace coordinates to the requested listing ID; exclude unbound locations.
+- Skip full parsing for group posts whose reliable permalink ID is already present.
+- Count accepted Marketplace listings toward `--limit`; keep a separate `--max-candidates` cost bound.
+- Store session directories and authentication state with owner-only POSIX permissions.
+- Reject missing CSV/SQLite output arguments before browser work.
+
+### Added
+
+- JSON collection diagnostics and explicit content/comment completeness indicators.
+- `forage doctor` for local setup checks without Facebook access.
+- `forage export` to reuse existing exporters with saved group JSON.
+- Network-blocked Chromium regression tests and a documented capability contract.
+
+
 ## [2.0.0] - 2026-08-29
 
 ### Added

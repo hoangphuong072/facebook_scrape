@@ -3,7 +3,9 @@
 [![CI](https://github.com/jwmoss/forage/actions/workflows/ci.yml/badge.svg)](https://github.com/jwmoss/forage/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
 
-CLI tool to scrape posts, comments, and reactions from private Facebook groups using browser automation.
+CLI tool to collect Facebook group posts and search Marketplace electronics through browser automation.
+
+Forage uses browser pages, not a public REST API. Results are partial observations. See the [capability contract](docs/capabilities.md).
 
 ## Table of Contents
 
@@ -89,7 +91,7 @@ uv run forage scrape your-group-slug --min-reactions 5
 uv run forage scrape your-group-slug --top-comments 10
 
 # Watch the browser (debugging)
-uv run forage scrape your-group-slug --no-headless -v
+uv run forage -v scrape your-group-slug --no-headless
 
 # Slower scraping to avoid rate limits
 uv run forage scrape your-group-slug --delay 5.0
@@ -113,6 +115,9 @@ Global Flags:
 Commands:
   login           Open browser for interactive Facebook login
   scrape          Scrape posts from a Facebook group
+  marketplace     Search Marketplace electronics
+  doctor          Check local browser and session setup
+  export          Convert saved group JSON without Facebook access
 ```
 
 #### scrape flags
@@ -121,7 +126,7 @@ Commands:
 |------|---------|-------------|
 | `--days` | `7` | Posts from last N days |
 | `--since` | - | Start date (ISO 8601: YYYY-MM-DD) |
-| `--until` | - | End date (ISO 8601: YYYY-MM-DD) |
+| `--until` | - | Inclusive end date (YYYY-MM-DD), in the local timezone |
 | `--limit` | `0` | Max posts (0 = unlimited) |
 | `--delay` | `2.0` | Seconds between page loads |
 | `--min-reactions` | `0` | Min reactions for comments |
@@ -133,6 +138,46 @@ Commands:
 | `-f, --format` | `json` | Output format: json, llm, sqlite, csv |
 | `--no-headless` | `false` | Show browser window |
 | `--browser` | `chromium` | Browser: chromium, firefox, webkit |
+
+### Marketplace search
+
+```bash
+uv run forage marketplace "rtx 4070" --city wilmington --radius 40 --limit 20 -o listings.json
+```
+
+`--limit` counts accepted listings. `--max-candidates` bounds the search cost, including rejected candidates; its default is 200.
+Forage excludes distant listings and listings whose coordinates it cannot verify. City is the search center, not a city-only filter.
+The current parser supports electronics with dollar prices or “Free” labels. Search relevance follows Facebook's results.
+
+### Local diagnosis and saved exports
+
+```bash
+# Check browser installation and session permissions without contacting Facebook
+uv run forage doctor
+
+# Convert an existing group result without another scrape or login
+uv run forage export posts.json --format sqlite --output posts.db
+uv run forage export posts.json --format csv --output posts.csv
+uv run forage export posts.json --format llm --output compact.json
+```
+
+`doctor` checks local files. It does not prove that a session remains valid. Install the selected browser before login:
+
+```bash
+uv run playwright install chromium
+# For --browser firefox or webkit, install that browser instead.
+```
+
+JSON and LLM JSON include collection diagnostics: stop reason, candidate count, rejected count, parse failures, and unknown timestamps.
+`partial: true` means the scraper cannot prove exhaustive coverage. A verified empty-page message produces `stop_reason: "empty"`.
+`content_truncated` identifies an unexpanded post. `comments_complete: false` means comment coverage is unverified.
+Keep the original JSON if you need these diagnostics beside CSV or SQLite output.
+
+Dates use the local system and browser timezone. `--until` includes the entire selected day. Reversed dates fail before login.
+The scraper retains posts with unknown timestamps and reports their count.
+
+Exit codes: `0` for a completed command, `1` for collection or output errors, `2` for invalid arguments,
+`3` for required authentication, and `4` for a recognized unavailable group. Empty results alone do not prove an empty group.
 
 ### SQLite Export
 
@@ -239,7 +284,10 @@ uv sync --extra dev
 # Run type checker
 uv run ty check src/
 
-# Run tests
+# Install Chromium for offline DOM tests
+uv run playwright install chromium
+
+# Run tests; browser fixtures block network access
 uv run pytest
 ```
 
@@ -260,29 +308,14 @@ src/forage/
 - Facebook's HTML structure changes frequently
 - Rate limiting may require slower scraping
 - Individual reaction types not broken out (only total)
-- Session cookies expire after ~30 days
+- Session lifetime depends on Facebook; use `forage login` when authentication fails
+- English page labels and supported DOM fixtures define the tested parser scope
+- Previously overwritten SQLite comments require a new scrape; upgrades cannot recover them
 
 ## Roadmap
 
-Planned features and improvements:
-
-### High Priority
-- [ ] **Cookie import** - Import cookies from browser extensions (EditThisCookie, Netscape format)
-- [ ] **Incremental scraping** - Only fetch posts newer than last scrape
-- [ ] **Progress persistence** - Resume interrupted scrapes
-
-### Medium Priority
-- [ ] **Multiple groups** - Scrape multiple groups in one command
-- [ ] **Media extraction** - Download images/videos from posts
-- [ ] **Reaction breakdown** - Extract individual reaction types (like, love, etc.)
-- [ ] **Author statistics** - Aggregate stats per author
-- [ ] **Scheduled scraping** - Cron-friendly mode with locking
-
-### Nice to Have
-- [ ] **Web UI** - Local web interface for browsing scraped data
-- [ ] **Webhook notifications** - Notify on new posts matching criteria
-- [ ] **Public group support** - Scrape without login for public groups
-- [ ] **Parallel scraping** - Speed up multi-group scrapes
+Prioritize sanitized DOM fixtures and verified selector updates. Add incremental collection only after identity and completeness checks support it.
+Use shell loops for batches, system scheduling for recurring commands, and SQLite or jq for analysis.
 
 ### Contributing
 
