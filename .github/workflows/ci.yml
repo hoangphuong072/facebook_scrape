@@ -59,7 +59,7 @@ jobs:
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           uvx --no-config zizmor==1.30.1 --no-progress .github/workflows
           shellcheck scripts/release.sh
-          shfmt -i 2 -d scripts/release.sh
+          go run mvdan.cc/sh/v3/cmd/shfmt@v3.14.1 -i 2 -d scripts/release.sh
       - name: Build and install wheel
         run: |
           uv build --no-config
