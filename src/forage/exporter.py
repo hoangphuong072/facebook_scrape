@@ -137,6 +137,8 @@ def _post_to_llm_format(post: Post, top_comments: int = 3) -> dict[str, Any]:
         "signals": signals,
         "timestamp": post.timestamp.isoformat() if post.timestamp else None,
         "top_comments": top_comments_data,
+        "content_truncated": post.content_truncated,
+        "comments_complete": post.comments_complete,
     }
 
 
@@ -171,6 +173,7 @@ def _build_llm_payload(
 
     return {
         "metadata": {
+            "diagnostics": result.diagnostics.model_dump(),
             "group_name": result.group.name,
             "group_url": result.group.url,
             "scraped_at": result.scraped_at.isoformat() if result.scraped_at else None,

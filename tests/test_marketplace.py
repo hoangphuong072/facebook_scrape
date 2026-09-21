@@ -40,13 +40,17 @@ def test_marketplace_listing_within_radius() -> None:
     center = (34.1327051, -77.9210288)
     item_id = "1618126739675766"
     detail_html = (
-        f'"id":"{item_id}","location":{{"latitude":33.780212402344,'
-        '"longitude":-78.975219726562}'
+        f'{{"id":"{item_id}","location":{{"latitude":33.780212402344,'
+        '"longitude":-78.975219726562}}'
     )
     local_detail_html = (
-        '"location":{"latitude":34.197692871094,"longitude":-77.887573242188},'
-        f'"id":"{item_id}"'
+        '{"location":{"latitude":34.197692871094,"longitude":-77.887573242188},'
+        f'"id":"{item_id}"}}'
     )
 
-    assert not _marketplace_listing_within_radius(detail_html, center, 40)
-    assert _marketplace_listing_within_radius(local_detail_html, center, 40)
+    assert not _marketplace_listing_within_radius(
+        detail_html, center, 40, listing_id=item_id
+    )
+    assert _marketplace_listing_within_radius(
+        local_detail_html, center, 40, listing_id=item_id
+    )

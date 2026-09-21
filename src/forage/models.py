@@ -49,6 +49,19 @@ class Post(BaseModel):
     reactions: Reactions = Field(default_factory=Reactions)
     comments_count: int = 0
     comments: list[Comment] = Field(default_factory=list)
+    content_truncated: bool = False
+    comments_complete: bool = False
+
+
+class CollectionDiagnostics(BaseModel):
+    """Explain collection limits without claiming exhaustive Facebook coverage."""
+
+    stop_reason: str = "unknown"
+    candidates_seen: int = 0
+    rejected_count: int = 0
+    parse_failures: int = 0
+    unknown_timestamps: int = 0
+    partial: bool = True
 
 
 class MarketplaceListing(BaseModel):
@@ -69,6 +82,7 @@ class MarketplaceResult(BaseModel):
     search_url: str
     scraped_at: datetime
     listings: list[MarketplaceListing] = Field(default_factory=list)
+    diagnostics: CollectionDiagnostics = Field(default_factory=CollectionDiagnostics)
 
 
 class GroupInfo(BaseModel):
@@ -93,3 +107,4 @@ class ScrapeResult(BaseModel):
     scraped_at: datetime
     date_range: DateRange
     posts: list[Post] = Field(default_factory=list)
+    diagnostics: CollectionDiagnostics = Field(default_factory=CollectionDiagnostics)

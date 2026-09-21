@@ -66,7 +66,7 @@ def _parse_compact_int(text: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def parse_timestamp(text: str) -> Optional[datetime]:
+def parse_timestamp(text: str, *, now: Optional[datetime] = None) -> Optional[datetime]:
     """
     Parse Facebook's relative/absolute timestamps to datetime.
 
@@ -85,7 +85,7 @@ def parse_timestamp(text: str) -> Optional[datetime]:
     if not text:
         return None
 
-    now = datetime.now()
+    now = now or datetime.now()
     lower_text = text.lower()
 
     if "just now" in lower_text:
@@ -116,6 +116,7 @@ def parse_timestamp(text: str) -> Optional[datetime]:
         time_match = re.search(
             r"yesterday\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[APap][Mm])",
             text,
+            re.IGNORECASE,
         )
         if time_match:
             time_str = time_match.group(1).strip().upper()
@@ -191,7 +192,9 @@ def parse_timestamp(text: str) -> Optional[datetime]:
     return None
 
 
-def _parse_post_timestamp(links: list[ElementHandle]) -> Optional[datetime]:
+def _parse_post_timestamp(
+    links: list[ElementHandle], *, now: Optional[datetime] = None
+) -> Optional[datetime]:
     """Parse a post timestamp from the link's visible metadata.
 
     Hovering a timestamp link adds roughly one second per post, which makes busy
@@ -204,8 +207,10 @@ def _parse_post_timestamp(links: list[ElementHandle]) -> Optional[datetime]:
         if "comment_id=" in href:
             continue
 
-        aria_timestamp = parse_timestamp(link.get_attribute("aria-label") or "")
-        text_timestamp = parse_timestamp(link.inner_text().strip())
+        aria_timestamp = parse_timestamp(
+            link.get_attribute("aria-label") or "", now=now
+        )
+        text_timestamp = parse_timestamp(link.inner_text().strip(), now=now)
         fallback_timestamp = aria_timestamp or text_timestamp
         if fallback_timestamp is None:
             continue
@@ -280,12 +285,91 @@ def parse_reactions_text(text: str) -> Reactions:
     return Reactions(total=total)
 
 
+def _article_content(
+    element: ElementHandle, author_name: str, *, expand: bool = False
+) -> tuple[str, bool]:
+    """Read this article's text without nested comments or interface controls."""
+    if expand:
+        for control in element.query_selector_all('button, [role="button"]'):
+            if control.inner_text().strip() != "See more":
+                continue
+            if not control.evaluate(
+                "(node, root) => node.closest('[role=article]') === root", element
+            ):
+                continue
+            try:
+                control.click(timeout=2000)
+            except Exception:
+                pass  # The remaining marker reports truncated content below.
+            break
+
+    snapshot = element.evaluate("""node => {
+        const copy = node.cloneNode(true);
+        copy.querySelectorAll('[role="article"]').forEach(child => child.remove());
+        const truncated = /See more/.test(copy.textContent);
+        copy.querySelectorAll('button, [role="button"]').forEach(child => child.remove());
+        copy.querySelectorAll('br').forEach(child => child.replaceWith("\\n"));
+        const bodies = Array.from(copy.querySelectorAll('[data-ad-preview="message"], [data-ad-comet-preview="message"]'));
+        const candidates = bodies.length ? bodies : Array.from(copy.querySelectorAll('div[dir="auto"]'));
+        const outer = candidates.filter(child => !candidates.some(parent => parent !== child && parent.contains(child)));
+        return {truncated, parts: outer.map(child => child.textContent), fallback: copy.textContent};
+    }""")
+    parts = snapshot["parts"] or snapshot["fallback"].splitlines()
+    content = []
+    for part in parts:
+        cleaned = re.sub(r"\s*…?\s*See more\s*$", "", part).strip()
+        if not cleaned or cleaned in {
+            author_name,
+            "Like",
+            "Comment",
+            "Share",
+            "Reply",
+            "·",
+        }:
+            continue
+        if re.fullmatch(r"\d+[hdwm]", cleaned):
+            continue
+        if cleaned not in content:
+            content.append(cleaned)
+    return "\n".join(content), snapshot["truncated"]
+
+
+def extract_post_identity(
+    article: ElementHandle,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return this article's reliable Facebook permalink identity, if available."""
+    for link in article.query_selector_all(
+        'a[href*="/posts/"], a[href*="story_fbid="]'
+    ):
+        href = link.get_attribute("href") or ""
+        if "comment_id=" in href:
+            continue
+        if not link.evaluate(
+            "(node, root) => node.closest('[role=article]') === root", article
+        ):
+            continue
+        url = urljoin("https://www.facebook.com", href)
+        if urlparse(url).hostname not in {
+            "facebook.com",
+            "www.facebook.com",
+            "m.facebook.com",
+            "web.facebook.com",
+        }:
+            continue
+        post_id = extract_post_id(url)
+        if post_id:
+            return post_id, url
+    return None, None
+
+
 def parse_modern_post(
     article: ElementHandle,
     page: Page,
     *,
     skip_reactions: bool = False,
     verbose: bool = False,
+    now: Optional[datetime] = None,
+    identity: Optional[tuple[Optional[str], Optional[str]]] = None,
 ) -> Optional[Post]:
     """Parse a post from www.facebook.com (modern React UI)."""
     try:
@@ -377,83 +461,21 @@ def parse_modern_post(
         if author_name in invalid_authors:
             author_name = "Unknown"
 
-        # Content: find the main post text
-        # The post content is usually in a div[dir="auto"] that's NOT inside buttons/links
-        # and has substantial text
-        content_divs = article.query_selector_all('div[dir="auto"]')
-        content_parts = []
-
-        skip_phrases = ["Like", "Comment", "Share", "Reply", author_name, "·"]
-
-        for div in content_divs:
-            text = div.inner_text().strip()
-            # Skip if too short, is the author name, or is a UI element
-            if len(text) < 10:
-                continue
-            if text == author_name:
-                continue
-            if any(text == phrase for phrase in skip_phrases):
-                continue
-            # Skip single-word timestamps
-            if re.match(r"^\d+[hdwm]$", text):
-                continue
-            # This looks like real content
-            content_parts.append(text)
-
-        # Dedupe while preserving order
-        seen = set()
-        unique_parts = []
-        for part in content_parts:
-            # Clean up the text
-            cleaned = part.strip()
-            # Remove "See more" suffix
-            cleaned = re.sub(r"\s*…?\s*See more\s*$", "", cleaned)
-            cleaned = re.sub(r"^\s*…?\s*See more\s*", "", cleaned)
-            if cleaned and cleaned not in seen:
-                seen.add(cleaned)
-                unique_parts.append(cleaned)
-
-        content = "\n".join(unique_parts[:2]) if unique_parts else ""
-
-        # If still no content, try to extract from the full text
-        if not content and len(lines) > 2:
-            # Filter out likely non-content lines
-            filtered_lines = []
-            for line in lines:
-                if line == author_name:
-                    continue
-                if re.match(r"^\d+[hdwm]$", line):  # timestamps like "6d"
-                    continue
-                if line in ["Like", "Comment", "Share", "·", "+3", "+1", "+2"]:
-                    continue
-                if len(line) > 10:
-                    filtered_lines.append(line)
-            content = "\n".join(filtered_lines[:3])
+        content, content_truncated = _article_content(article, author_name, expand=True)
 
         # Find timestamp - look for aria-label with time info or links with timestamps
         time_links = article.query_selector_all(
             'a[href*="/posts/"], a[href*="?story_fbid"]'
         )
-        timestamp = _parse_post_timestamp(time_links)
+        timestamp = _parse_post_timestamp(time_links, now=now)
 
         # Extract post ID and permalink from any post link
-        post_id = None
-        post_url = None
-        all_links = article.query_selector_all("a[href]")
-        for link in all_links:
-            href = link.get_attribute("href")
-            if href:
-                post_id = extract_post_id(href)
-                if post_id:
-                    if href.startswith("http"):
-                        post_url = href.split("?")[0]
-                    else:
-                        post_url = f"https://www.facebook.com{href}".split("?")[0]
-                    break
+        post_id, post_url = identity or extract_post_identity(article)
 
         if not post_id:
             post_id = _stable_id(
                 "post",
+                page.url,
                 author_name,
                 profile_url or "",
                 content,
@@ -497,10 +519,15 @@ def parse_modern_post(
         )
         for btn in comment_buttons:
             aria = btn.get_attribute("aria-label") or ""
-            match = re.search(r"(\d+)\s*comment", aria.lower())
+            match = re.search(r"([\d,.]+\s*[kKmM]?)\s*comments?\b", aria)
             if match:
-                comments_count = int(match.group(1))
+                comments_count = _parse_compact_int(match.group(1))
                 break
+
+        if not comments_count:
+            match = re.search(r"([\d,.]+\s*[kKmM]?)\s*comments?\b", all_text)
+            if match:
+                comments_count = _parse_compact_int(match.group(1))
 
         # Only return if we have some content
         if not content or len(content) < 5:
@@ -515,6 +542,7 @@ def parse_modern_post(
             reactions=reactions,
             comments_count=comments_count,
             comments=[],
+            content_truncated=content_truncated,
         )
 
     except Exception as e:
@@ -527,6 +555,7 @@ def parse_modern_comment(
     *,
     skip_reactions: bool = False,
     verbose: bool = False,
+    post_id: str = "",
 ) -> Optional[Comment]:
     """Parse a comment from www.facebook.com (modern React UI)."""
     try:
@@ -560,60 +589,25 @@ def parse_modern_comment(
                 profile_url = href
                 break
 
-        # Content: look for text that's not the author name or UI elements
-        content_parts = []
-        skip_words = [
-            "Like",
-            "Reply",
-            "Share",
-            "·",
-            author_name,
-            "See more",
-            "View replies",
-        ]
-
-        content_divs = element.query_selector_all('div[dir="auto"]')
-        for div in content_divs:
-            text = div.inner_text().strip()
-            if text and len(text) > 5 and text not in skip_words:
-                # Skip timestamps
-                if re.match(r"^\d+[hdwm]$", text):
-                    continue
-                content_parts.append(text)
-
-        # Dedupe
-        seen = set()
-        unique_parts = []
-        for part in content_parts:
-            cleaned = re.sub(r"\s*…?\s*See more\s*$", "", part).strip()
-            if cleaned and cleaned not in seen and cleaned != author_name:
-                seen.add(cleaned)
-                unique_parts.append(cleaned)
-
-        content = unique_parts[0] if unique_parts else ""
-
-        if not content:
-            # Fallback: try to extract from lines
-            for line in lines:
-                if line == author_name:
-                    continue
-                if line in skip_words:
-                    continue
-                if re.match(r"^\d+[hdwm]$", line):
-                    continue
-                if len(line) > 5:
-                    content = line
-                    break
-
+        content, _ = _article_content(element, author_name)
         if not content:
             return None
 
-        # Generate comment ID
-        comment_id = _stable_id(
-            "comment",
-            author_name,
-            profile_url or "",
-            content,
+        comment_id = None
+        for link in element.query_selector_all('a[href*="comment_id="]'):
+            if not link.evaluate(
+                "(node, root) => node.closest('[role=article]') === root.closest('[role=article]')",
+                element,
+            ):
+                continue
+            params = parse_qs(urlparse(link.get_attribute("href") or "").query)
+            comment_id = (
+                params.get("reply_comment_id") or params.get("comment_id") or [None]
+            )[0]
+            if comment_id:
+                break
+        comment_id = comment_id or _stable_id(
+            "comment", post_id, author_name, profile_url or "", content
         )
 
         # Try to get reaction count

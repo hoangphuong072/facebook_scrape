@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+import json
 import random
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -26,6 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from forage.auth import load_context, is_logged_in_page
 from forage.models import (
     Comment,
+    CollectionDiagnostics,
     DateRange,
     GroupInfo,
     MarketplaceListing,
@@ -35,6 +37,7 @@ from forage.models import (
 )
 from forage.parser import (
     filter_comments,
+    extract_post_identity,
     parse_marketplace_listing,
     parse_modern_post,
     parse_modern_comment,
@@ -113,6 +116,7 @@ class MarketplaceOptions:
     city: str = "wilmington"
     radius: int = 40
     limit: int = 20
+    max_candidates: int = 200
     headless: bool = True
     verbose: bool = False
     session_dir: Optional[Path] = None
@@ -183,24 +187,49 @@ def _marketplace_center(html: str) -> Optional[tuple[float, float]]:
     return float(match.group(1)), float(match.group(2))
 
 
+def _listing_location(html: str, listing_id: str) -> Optional[dict]:
+    """Use only coordinates on the requested listing's embedded JSON object."""
+    scripts = re.findall(
+        r"<script\b[^>]*>(.*?)</script>", html, re.DOTALL | re.IGNORECASE
+    )
+    for source in scripts or [html]:
+        try:
+            pending = [json.loads(source)]
+        except (ValueError, RecursionError):
+            continue
+        while pending:
+            item = pending.pop()
+            if isinstance(item, list):
+                pending.extend(item)
+            elif isinstance(item, dict):
+                if str(item.get("id")) == listing_id and isinstance(
+                    item.get("location"), dict
+                ):
+                    return item["location"]
+                pending.extend(item.values())
+    return None
+
+
 def _marketplace_listing_within_radius(
     html: str,
     center: tuple[float, float],
     radius: int,
+    *,
+    listing_id: str,
 ) -> bool:
-    pattern = re.compile(
-        r'"location"\s*:\s*\{\s*"latitude"\s*:\s*(-?\d+(?:\.\d+)?),'
-        r'\s*"longitude"\s*:\s*(-?\d+(?:\.\d+)?)',
-    )
-    match = pattern.search(html)
-    if not match:
+    location = _listing_location(html, listing_id)
+    if location is None:
         return False
-
-    destination = float(match.group(1)), float(match.group(2))
+    try:
+        destination = float(location["latitude"]), float(location["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (-90 <= destination[0] <= 90 and -180 <= destination[1] <= 180):
+        return False
     lat1, lon1, lat2, lon2 = map(math.radians, (*center, *destination))
     latitude = math.sin((lat2 - lat1) / 2) ** 2
     longitude = math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-    return 2 * 3958.8 * math.asin(math.sqrt(latitude + longitude)) <= radius
+    return 2 * 3958.8 * math.asin(math.sqrt(min(1.0, latitude + longitude))) <= radius
 
 
 def _listing_matches_radius(
@@ -212,7 +241,9 @@ def _listing_matches_radius(
 ) -> bool:
     try:
         navigate_with_retry(page, listing.url, max_retries=1, verbose=verbose)
-        return _marketplace_listing_within_radius(page.content(), center, radius)
+        return _marketplace_listing_within_radius(
+            page.content(), center, radius, listing_id=listing.id
+        )
     except Exception as error:
         if verbose:
             console.print(
@@ -222,20 +253,28 @@ def _listing_matches_radius(
         return False
 
 
-def calculate_date_range(options: ScrapeOptions) -> tuple[datetime, datetime]:
+def calculate_date_range(
+    options: ScrapeOptions, *, now: Optional[datetime] = None
+) -> tuple[datetime, datetime]:
     """Calculate the date range for scraping."""
-    now = datetime.now()
+    now = now or datetime.now()
 
     if options.until:
-        until_date = datetime.fromisoformat(options.until)
+        until_date = datetime.combine(
+            date.fromisoformat(options.until), datetime_time()
+        ) + timedelta(days=1)
     else:
         until_date = now
 
     if options.since:
-        since_date = datetime.fromisoformat(options.since)
+        since_date = datetime.combine(
+            date.fromisoformat(options.since), datetime_time()
+        )
     else:
         since_date = until_date - timedelta(days=options.days)
 
+    if since_date >= until_date and options.since:
+        raise ValueError("--since must not be after --until")
     return since_date, until_date
 
 
@@ -310,6 +349,8 @@ def scrape_post_comments(
     page: Page,
     article: ElementHandle,
     options: ScrapeOptions,
+    *,
+    post_id: str = "",
 ) -> list[Comment]:
     """
     Scrape comments from a post by clicking to expand them.
@@ -340,6 +381,7 @@ def scrape_post_comments(
                         elem,
                         skip_reactions=options.skip_reactions,
                         verbose=options.verbose,
+                        post_id=post_id,
                     )
                     if (
                         comment
@@ -354,6 +396,7 @@ def scrape_post_comments(
                 elem,
                 skip_reactions=options.skip_reactions,
                 verbose=options.verbose,
+                post_id=post_id,
             )
             if comment and comment.content and comment.id not in seen_comment_ids:
                 comments.append(comment)
@@ -383,6 +426,7 @@ def scrape_post_comments(
                 elem,
                 skip_reactions=options.skip_reactions,
                 verbose=options.verbose,
+                post_id=post_id,
             )
             if comment and comment.content and comment.id not in seen_comment_ids:
                 comments.append(comment)
@@ -406,6 +450,8 @@ def scrape_comments_from_post_page(
     page: Page,
     post_url: str,
     options: ScrapeOptions,
+    *,
+    post_id: str = "",
 ) -> list[Comment]:
     """
     Navigate to a post's dedicated page and scrape all comments.
@@ -474,6 +520,7 @@ def scrape_comments_from_post_page(
                 elem,
                 skip_reactions=options.skip_reactions,
                 verbose=options.verbose,
+                post_id=post_id or post_url,
             )
             if comment and comment.content and comment.id not in seen_comment_ids:
                 reply_ids: set[str] = set()
@@ -482,6 +529,7 @@ def scrape_comments_from_post_page(
                         reply_elem,
                         skip_reactions=options.skip_reactions,
                         verbose=options.verbose,
+                        post_id=post_id or post_url,
                     )
                     if (
                         reply
@@ -531,7 +579,9 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
         ScrapeResult with group info and posts
     """
     group_id = normalize_group_identifier(group)
-    since_date, until_date = calculate_date_range(options)
+    scraped_at = datetime.now()
+    since_date, until_date = calculate_date_range(options, now=scraped_at)
+    diagnostics = CollectionDiagnostics(stop_reason="no_new_posts")
 
     if options.verbose:
         console.print(f"Scraping group: {group_id}")
@@ -582,6 +632,21 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
 
         group_info = extract_group_info(page, group_id)
 
+        if not page.query_selector('[role="feed"]'):
+            body = page.inner_text("body")
+            if "No posts yet" in body:
+                diagnostics.stop_reason = "empty"
+                diagnostics.partial = False
+            elif (
+                "This content isn't available" in body
+                or "This group isn't available" in body
+            ):
+                raise GroupNotFoundError(group_id)
+            else:
+                raise RuntimeError(
+                    "Facebook group feed is missing; access or page layout may have changed"
+                )
+
         if options.verbose:
             console.print(f"Group name: {group_info.name}")
 
@@ -604,6 +669,7 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
 
             while True:
                 if options.limit and len(posts) >= options.limit:
+                    diagnostics.stop_reason = "limit"
                     break
 
                 # Facebook posts are [role="article"] elements within the feed.
@@ -640,6 +706,9 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                 new_posts_this_page = 0
 
                 for i, article in enumerate(articles):
+                    identity = extract_post_identity(article)
+                    if identity[0] and identity[0] in seen_post_ids:
+                        continue
                     if options.verbose and len(posts) == 0 and i < 2:
                         article_text = article.inner_text()
                         inner = article_text[:200] if article_text else "(empty)"
@@ -650,8 +719,11 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                         page,
                         skip_reactions=options.skip_reactions,
                         verbose=options.verbose,
+                        now=scraped_at,
+                        identity=identity,
                     )
                     if not post:
+                        diagnostics.parse_failures += 1
                         if options.verbose and len(posts) == 0 and i < 2:
                             console.print(f"Article {i}: parse returned None")
                         continue
@@ -662,18 +734,24 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                         continue
 
                     seen_post_ids.add(post.id)
+                    diagnostics.candidates_seen += 1
 
                     if post.timestamp:
                         if post.timestamp < since_date:
+                            diagnostics.rejected_count += 1
                             consecutive_old_posts += 1
                             if consecutive_old_posts >= max_consecutive_old:
                                 pages_without_new_posts = max_empty_pages
+                                diagnostics.stop_reason = "date_boundary"
                                 break
                             continue
-                        if post.timestamp > until_date:
+                        if post.timestamp >= until_date:
+                            diagnostics.rejected_count += 1
                             continue
                         # Reset counter when we find a post in range
                         consecutive_old_posts = 0
+                    else:
+                        diagnostics.unknown_timestamps += 1
 
                     # Scrape comments if not skipped and post has comments
                     if not options.skip_comments and post.comments_count > 0:
@@ -683,7 +761,9 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                         )
 
                         # Try to scrape comments from the article element first
-                        post.comments = scrape_post_comments(page, article, options)
+                        post.comments = scrape_post_comments(
+                            page, article, options, post_id=post.id
+                        )
 
                         # If no comments found and we have a post URL, try navigating to it
                         if not post.comments:
@@ -697,7 +777,7 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                                     if not href.startswith("http"):
                                         href = f"https://www.facebook.com{href}"
                                     post.comments = scrape_comments_from_post_page(
-                                        page, href, options
+                                        page, href, options, post_id=post.id
                                     )
 
                         human_delay(page, options.delay * 0.5, options.delay * 0.2)
@@ -714,6 +794,9 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                     pages_without_new_posts += 1
                 else:
                     pages_without_new_posts = 0
+
+                if diagnostics.stop_reason == "date_boundary":
+                    break
 
                 if pages_without_new_posts >= max_empty_pages:
                     break
@@ -755,10 +838,8 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
         browser.close()
 
     if found_articles and not parsed_any:
-        console.print(
-            "[yellow]Warning: feed articles were found but none parsed as posts — "
-            "Facebook may have changed their HTML. "
-            "Re-run with -v to see parse errors.[/yellow]"
+        raise RuntimeError(
+            "Facebook feed articles exist but no posts parse; page layout may have changed"
         )
 
     if options.verbose:
@@ -766,12 +847,13 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
 
     return ScrapeResult(
         group=group_info,
-        scraped_at=datetime.now(),
+        scraped_at=scraped_at,
         date_range=DateRange(
             since=since_date.strftime("%Y-%m-%d"),
-            until=until_date.strftime("%Y-%m-%d"),
+            until=options.until or until_date.strftime("%Y-%m-%d"),
         ),
         posts=posts,
+        diagnostics=diagnostics,
     )
 
 
@@ -783,6 +865,7 @@ def search_marketplace(
     search_url = get_marketplace_url(query, options.city, options.radius)
     listings: list[MarketplaceListing] = []
     seen_ids: set[str] = set()
+    diagnostics = CollectionDiagnostics(stop_reason="no_new_listings")
 
     with sync_playwright() as playwright:
         browser = getattr(playwright, options.browser_type).launch(
@@ -793,11 +876,26 @@ def search_marketplace(
         width, height = random.choice(VIEWPORT_SIZES)
         page.set_viewport_size({"width": width, "height": height})
         navigate_with_retry(page, search_url, verbose=options.verbose)
-        page.wait_for_selector('a[href*="/marketplace/item/"]', timeout=10000)
 
         if not is_logged_in_page(page, navigate=False):
             browser.close()
             raise AuthenticationError("Not logged in or session expired")
+
+        try:
+            page.wait_for_selector('a[href*="/marketplace/item/"]', timeout=10000)
+        except PlaywrightTimeoutError as error:
+            if "No results found" not in page.inner_text("body"):
+                raise RuntimeError(
+                    "Marketplace results are missing; page layout or access may have changed"
+                ) from error
+            browser.close()
+            return MarketplaceResult(
+                query=query,
+                city=options.city,
+                search_url=search_url,
+                scraped_at=datetime.now(),
+                diagnostics=CollectionDiagnostics(stop_reason="empty", partial=False),
+            )
 
         center = _marketplace_center(page.content())
         if center is None:
@@ -807,12 +905,19 @@ def search_marketplace(
 
         detail_page = context.new_page()
         empty_scrolls = 0
-        while len(seen_ids) < options.limit and empty_scrolls < 3:
+        while (
+            len(listings) < options.limit
+            and len(seen_ids) < options.max_candidates
+            and empty_scrolls < 3
+        ):
             previous_count = len(seen_ids)
             for element in page.query_selector_all('a[href*="/marketplace/item/"]'):
                 listing = parse_marketplace_listing(element, verbose=options.verbose)
+                if listing is None:
+                    diagnostics.parse_failures += 1
                 if listing and listing.id not in seen_ids:
                     seen_ids.add(listing.id)
+                    diagnostics.candidates_seen += 1
                     if _listing_matches_radius(
                         detail_page,
                         listing,
@@ -821,16 +926,26 @@ def search_marketplace(
                         options.verbose,
                     ):
                         listings.append(listing)
-                    if len(seen_ids) >= options.limit:
+                    else:
+                        diagnostics.rejected_count += 1
+                    if (
+                        len(listings) >= options.limit
+                        or len(seen_ids) >= options.max_candidates
+                    ):
                         break
 
             empty_scrolls = empty_scrolls + 1 if len(seen_ids) == previous_count else 0
-            if len(seen_ids) < options.limit:
+            if len(listings) < options.limit and len(seen_ids) < options.max_candidates:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(2000)
 
         detail_page.close()
         browser.close()
+
+    if len(listings) >= options.limit:
+        diagnostics.stop_reason = "limit"
+    elif len(seen_ids) >= options.max_candidates:
+        diagnostics.stop_reason = "candidate_limit"
 
     return MarketplaceResult(
         query=query,
@@ -838,6 +953,7 @@ def search_marketplace(
         search_url=search_url,
         scraped_at=datetime.now(),
         listings=listings,
+        diagnostics=diagnostics,
     )
 
 
